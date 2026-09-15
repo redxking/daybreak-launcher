@@ -298,6 +298,21 @@ class LauncherTests(unittest.TestCase):
         d.git("commit", "-m", "Fixture", cwd=root)
         d.git("remote", "add", "origin", "https://github.com/example/repo.git", cwd=root)
 
+    @unittest.skipIf(os.name == "nt", "Windows forbids carriage returns in filenames")
+    def test_reset_preserves_carriage_return_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repository"
+            self.init_repo(repo)
+            name = "name\rfile.txt"
+            (repo / name).write_text("committed\n")
+            d.git("add", "--", name, cwd=repo)
+            d.git("commit", "-m", "Filename fixture", cwd=repo)
+            revision = d.git("rev-parse", "HEAD", cwd=repo)
+            d.git("update-index", "--assume-unchanged", "--", name, cwd=repo)
+            (repo / name).write_text("hidden change\n")
+            d.reset_patch_checkout(repo, revision)
+            self.assertEqual((repo / name).read_text(), "committed\n")
+
     def test_two_findings_make_independent_branches_and_draft_requests(self):
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp); repo = job / "repository"

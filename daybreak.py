@@ -201,13 +201,16 @@ def configure_auth(root):
     AUTH_ROOT = root
 
 
-def run(args, *, capture=False, check=True, cwd=None, env=None, timeout=None, input_data=None):
+def run(args, *, capture=False, check=True, cwd=None, env=None, timeout=None, input_data=None, binary=False):
     # Never use a shell: repository names and paths remain literal arguments.
     p = subprocess.run([str(a) for a in args], cwd=cwd, env=child_env() if env is None else env,
                        input=input_data,
-                       text=True, stdout=subprocess.PIPE if capture else None,
+                       text=not binary, stdout=subprocess.PIPE if capture else None,
                        stderr=subprocess.PIPE if capture else None, timeout=timeout)
     if check and p.returncode:
+        if binary and capture:
+            p.stderr = (p.stderr or b"").decode("utf-8", errors="replace")
+            p.stdout = (p.stdout or b"").decode("utf-8", errors="replace")
         raise SetupError(f"{Path(str(args[0])).name} failed (exit {p.returncode}). "
                          + ((p.stderr or p.stdout or "").strip() if capture else "See the output above."))
     return p
@@ -497,10 +500,10 @@ def patch_files(patch, checkout):
 def reset_repository_state(repository, revision):
     if git("config", "--bool", "core.sparseCheckout", cwd=repository, check=False) == "true":
         git("sparse-checkout", "disable", cwd=repository)
-    tracked = run(["git", "ls-files", "-z"], capture=True, cwd=repository).stdout
+    tracked = run(["git", "ls-files", "-z"], capture=True, cwd=repository, binary=True).stdout
     if tracked:
         for option in ("--no-assume-unchanged", "--no-skip-worktree"):
-            run(["git", "update-index", option, "-z", "--stdin"], cwd=repository, input_data=tracked)
+            run(["git", "update-index", option, "-z", "--stdin"], cwd=repository, input_data=tracked, binary=True)
     git("reset", "--hard", revision, cwd=repository)
     git("clean", "-ffdx", cwd=repository)
 
