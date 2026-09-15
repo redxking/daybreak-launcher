@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import uuid
+import hashlib
+import getpass
 from urllib.parse import urlsplit
 
 VERSION = "0.1.27"
@@ -240,7 +242,14 @@ def git(*args, cwd=None, check=True):
 def source_details(source):
     local = Path(source).expanduser()
     if local.exists():
-        root = Path(git("rev-parse", "--show-toplevel", cwd=local)).resolve()
+        if not local.is_dir():
+            raise SetupError("Select a code folder, not an individual file.")
+        probe = run(["git", "rev-parse", "--show-toplevel"], cwd=local, capture=True, check=False)
+        if probe.returncode:
+            if (local / ".git").exists() or (local / ".git").is_symlink() or "not a git repository" not in probe.stderr.lower():
+                raise SetupError("Git could not inspect this folder. Resolve the repository error first: " + probe.stderr.strip())
+            return local.resolve(), None, None, None
+        root = Path(probe.stdout.strip()).resolve()
         if git("status", "--porcelain", "--untracked-files=normal", cwd=root):
             raise SetupError("The local repository has uncommitted or untracked files. Commit the intended code first; this launcher reviews an isolated copy of a committed revision.")
         remote = git("remote", "get-url", "origin", cwd=root, check=False)
@@ -251,6 +260,61 @@ def source_details(source):
         return root, remote, revision, branch
     remote_details(source)
     return None, source, None, None
+
+
+def snapshot_folder(source, checkout, job):
+    """Copy ordinary files, without following links or including common local secrets/caches."""
+    source = source.resolve()
+    if job.resolve().is_relative_to(source):
+        raise SetupError("The review storage is inside the selected folder. Select a narrower source folder.")
+    skipped_dirs = {".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__", ".codex", ".ssh", "codex-home", "security-state"}
+    skipped_names = {".DS_Store", "auth.json", "id_rsa", "id_ed25519"}
+    included, excluded = [], []
+    checkout.mkdir()
+    for parent, dirs, names in os.walk(source, followlinks=False):
+        parent = Path(parent)
+        for name in list(dirs):
+            path = parent / name
+            if name in skipped_dirs or path.is_symlink():
+                dirs.remove(name)
+                excluded.append(path.relative_to(source).as_posix() + "/")
+        for name in names:
+            path = parent / name
+            relative = path.relative_to(source)
+            if (path.is_symlink() or not path.is_file() or name in skipped_names
+                    or name.endswith((".pyc", ".pyo", ".pem", ".key", ".p12", ".pfx"))
+                    or (name == ".env" or name.startswith(".env.")) and name != ".env.example"):
+                excluded.append(relative.as_posix())
+                continue
+            dest = checkout / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Open without following a final symlink where the OS supports it.
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as inp, dest.open("wb") as out:
+                before = os.fstat(inp.fileno())
+                digest = hashlib.sha256()
+                while chunk := inp.read(1024 * 1024):
+                    digest.update(chunk)
+                    out.write(chunk)
+                after = os.fstat(inp.fileno())
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise SetupError("A source file changed while copying. Rerun with a stable folder.")
+            dest.chmod(before.st_mode & 0o777)
+            included.append({"path": relative.as_posix(), "sha256": digest.hexdigest()})
+    (job / "source-snapshot.json").write_text(json.dumps({"source": str(source), "files": included, "excluded": excluded}, indent=2) + "\n", encoding="utf-8")
+    if not included:
+        raise SetupError("No regular source files remain after excluding credentials, links, and dependency caches.")
+    git("init", "-b", "main", str(checkout))
+    hooks = job / "empty-hooks"
+    hooks.mkdir()
+    git("config", "core.hooksPath", str(hooks), cwd=checkout)
+    for field, fallback in (("user.name", getpass.getuser()), ("user.email", getpass.getuser() + "@localhost")):
+        if not git("config", "--get", field, cwd=checkout, check=False):
+            git("config", field, fallback, cwd=checkout)
+    # Track the complete copied snapshot, even if the supplied .gitignore excludes code.
+    git("add", "--force", "--all", cwd=checkout)
+    git("-c", "commit.gpgsign=false", "commit", "-m", "Local source review snapshot", cwd=checkout)
+    print(f"Local folder snapshot: {len(included)} files; {len(excluded)} excluded entries. See source-snapshot.json.")
 
 
 def repository_login(host, remote, root, *, device=False):
@@ -332,11 +396,11 @@ def pr_body(finding, patch, revision):
             "The scan report records coverage and unreviewed areas; this PR does not certify the whole application.\n")
 
 
-def publish_findings(command, document, checkout, job, root, host, remote, base_branch):
+def publish_findings(command, document, checkout, job, root, host, remote, base_branch, *, publish=True):
     findings = confirmed_findings(document)
     revision = git("rev-parse", "HEAD", cwd=checkout)
     published = []
-    print(f"{len(findings)} confirmed findings selected for individual fixes and draft requests.", flush=True)
+    print(f"{len(findings)} confirmed findings selected for individual fixes" + (" and draft requests." if publish else "; patches will remain local."), flush=True)
     for index, finding in enumerate(findings, 1):
         identifier = finding["occurrenceId"]
         if not re.fullmatch(r"occ_[A-Za-z0-9_-]+", identifier):
@@ -361,8 +425,8 @@ def publish_findings(command, document, checkout, job, root, host, remote, base_
             raise SetupError(f"Fix was not verified. Inspect {output}; nothing was published for this finding.")
         if git("rev-parse", "HEAD", cwd=checkout) != revision or git("branch", "--show-current", cwd=checkout) != branch:
             raise SetupError("The patch changed the branch or commit unexpectedly. Inspect the retained checkout.")
-        if (git("remote", "get-url", "--all", "origin", cwd=checkout) != remote
-                or git("remote", "get-url", "--push", "--all", "origin", cwd=checkout) != remote):
+        if publish and (git("remote", "get-url", "--all", "origin", cwd=checkout) != remote
+                        or git("remote", "get-url", "--push", "--all", "origin", cwd=checkout) != remote):
             raise SetupError("The patch changed the publication remote. No request created.")
         files = patch_files(patch, checkout)
         git("--literal-pathspecs", "add", "--", *files, cwd=checkout)
@@ -376,15 +440,26 @@ def publish_findings(command, document, checkout, job, root, host, remote, base_
             raise SetupError("The patch left changes outside its reported files. Review the checkout before publishing.")
         title = "Security: " + re.sub(r"[\r\n\x00-\x1f]", " ", finding["title"])[:180]
         body = job / f"pr-{identifier}.md"
-        body.write_text(pr_body(finding, patch, revision), encoding="utf-8")
+        description = pr_body(finding, patch, revision)
+        if not publish:
+            description = description.replace("The Files changed view shows the original and replacement code. This request contains one finding's patch.",
+                                              "The accompanying .patch file shows the original and replacement code for this finding. The original folder was not edited.")
+        body.write_text(description, encoding="utf-8")
         staged_tree = git("write-tree", cwd=checkout)
         git("commit", "-m", title, cwd=checkout)
         if (git("rev-parse", "HEAD^{tree}", cwd=checkout) != staged_tree
                 or git("rev-parse", "HEAD^", cwd=checkout) != revision
                 or git("branch", "--show-current", cwd=checkout) != branch
                 or git("status", "--porcelain", cwd=checkout)
-                or git("remote", "get-url", "--push", "--all", "origin", cwd=checkout) != remote):
+                or (publish and git("remote", "get-url", "--push", "--all", "origin", cwd=checkout) != remote)):
             raise SetupError("Commit hooks changed the expected patch state or destination. No request created.")
+        if not publish:
+            diff = job / f"fix-{identifier}.patch"
+            diff.write_text(git("diff", "--binary", revision, branch, cwd=checkout) + "\n", encoding="utf-8")
+            published.append({"finding": identifier, "branch": branch, "patch": str(diff), "published": False})
+            (job / "local-fixes.json").write_text(json.dumps(published, indent=2) + "\n", encoding="utf-8")
+            print(f"Verified local patch: {diff}", flush=True)
+            continue
         run(["git", "push", "--set-upstream", "origin", branch], cwd=checkout)
         if host == "github.com":
             args = ["gh", "pr", "create", "--draft", "--repo", remote, "--base", base_branch,
@@ -402,7 +477,7 @@ def publish_findings(command, document, checkout, job, root, host, remote, base_
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Set up Daybreak, review a Git repository, verify patches, and open draft requests.")
-    parser.add_argument("repository", nargs="?", help="Local Git folder or GitHub/GitLab repository URL")
+    parser.add_argument("repository", nargs="?", help="Local code folder, Git checkout, or GitHub/GitLab repository URL")
     parser.add_argument("--check", action="store_true", help="Check setup only; may install the CLI, but does not sign in or scan")
     parser.add_argument("--dry-run", action="store_true", help="Clone and validate inputs without model use, patches, or requests")
     parser.add_argument("--scan-only", action="store_true", help="Review without patching or creating requests")
@@ -431,26 +506,32 @@ def main(argv=None):
     if not source:
         raise SetupError("A repository folder or URL is required.")
     local, remote, revision, branch = source_details(source)
-    publish = not args.scan_only and not args.dry_run
+    plain_folder = local is not None and revision is None
+    fix = not args.scan_only and not args.dry_run
+    publish = fix and bool(remote)
+    host = None
     canonical = None
     if remote:
         host, _, canonical = remote_details(remote)
         if publish:
             repository_login(host, canonical, root, device=device_auth)
-    elif publish:
-        raise SetupError("No origin remote is configured. Add a GitHub/GitLab origin, or use --scan-only.")
+    if not remote:
+        print("No remote repository: analysis and verified fixes stay local. No PR will be created.")
     job = Path(tempfile.mkdtemp(prefix="review-", dir=root))
     checkout, results = job / "repository", job / "results"
-    clone = ["git", "clone", "--no-hardlinks", "--recurse-submodules"]
-    if local:
-        clone += ["--branch", branch]
-    run(clone + ["--", str(local) if local else canonical, checkout], cwd=root)
-    if local:
+    if plain_folder:
+        snapshot_folder(local, checkout, job)
+    else:
+        clone = ["git", "clone", "--no-hardlinks", "--recurse-submodules"]
+        if local:
+            clone += ["--branch", branch]
+        run(clone + ["--", str(local) if local else canonical, checkout], cwd=root)
+    if local and not plain_folder:
         if git("rev-parse", "HEAD", cwd=checkout) != revision or git("status", "--porcelain", cwd=local):
             raise SetupError("Source changed during preparation. Rerun after saving a stable commit.")
         if canonical:
             git("remote", "set-url", "origin", canonical, cwd=checkout)
-    if publish:
+    if fix:
         for field, prompt in (("user.name", "Git commit author name"), ("user.email", "Git commit author email")):
             if not git("config", "--get", field, cwd=checkout, check=False):
                 value = input(prompt + ": ").strip()
@@ -466,18 +547,20 @@ def main(argv=None):
     scanned_revision = git('rev-parse', 'HEAD', cwd=checkout)
     print(f"Reviewing commit {scanned_revision}")
     print(f"Checkout and results: {job}")
-    print("Git LFS binary assets are excluded. Repository analysis may execute code with your OS permissions.")
+    print("Git clones exclude LFS binary assets. Repository analysis may execute code with your OS permissions.")
     print("Using ChatGPT subscription authentication; account limits and Daybreak access still apply.")
+    print("The CLI may display API-equivalent USD estimates. These are not a billing receipt or a measure of subscription allowance.")
     output = job / "scan-output.json"
     document = json_command(command + scan_args(checkout, results, scan_only=args.scan_only, dry_run=args.dry_run, deep=args.deep),
                             output, cwd=root)
-    if publish:
+    if fix:
         if git("rev-parse", "HEAD", cwd=checkout) != scanned_revision:
             raise SetupError("The scan changed the checkout commit. Inspect the retained checkout before patching.")
-        publish_findings(command, document, checkout, job, root, host, canonical, base_branch)
+        publish_findings(command, document, checkout, job, root, host, canonical, base_branch, publish=publish)
     (job / "launcher-result.json").write_text(json.dumps({
         "cli_version": VERSION, "model": MODEL, "authentication": "chatgpt", "exit_code": 0,
         "dry_run": args.dry_run, "patch_and_draft_request_requested": publish,
+        "local_fixes_requested": fix and not publish, "plain_folder_snapshot": plain_folder,
         "repository": str(checkout), "results": str(results)
     }, indent=2) + "\n", encoding="utf-8")
     print(f"Saved run location: {job}")

@@ -12,6 +12,54 @@ import daybreak as d
 
 
 class LauncherTests(unittest.TestCase):
+    def test_plain_folder_snapshot_excludes_secrets_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, job = Path(tmp) / "folder with spaces", Path(tmp) / "job"
+            source.mkdir(); job.mkdir()
+            (source / "main.py").write_text("original\n")
+            (source / ".gitignore").write_text("main.py\n")
+            (source / ".env").write_text("synthetic secret")
+            (source / "__pycache__").mkdir()
+            (source / "outside").symlink_to(job, target_is_directory=True)
+            details = d.source_details(str(source))
+            self.assertEqual(details, (source.resolve(), None, None, None))
+            checkout = job / "repository"
+            d.snapshot_folder(source, checkout, job)
+            self.assertFalse((source / ".git").exists())
+            self.assertEqual((source / "main.py").read_text(), "original\n")
+            self.assertFalse((checkout / ".env").exists())
+            self.assertFalse((checkout / "outside").exists())
+            self.assertIn("main.py", d.git("ls-files", cwd=checkout))
+            self.assertEqual(d.git("status", "--porcelain", cwd=checkout), "")
+            manifest = json.loads((job / "source-snapshot.json").read_text())
+            self.assertIn(".env", manifest["excluded"])
+
+    def test_local_fix_saved_without_host_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, job = Path(tmp) / "source", Path(tmp) / "job"
+            source.mkdir(); job.mkdir()
+            (source / "a.py").write_text("original\n")
+            repo = job / "repository"
+            d.snapshot_folder(source, repo, job)
+            finding = {"occurrenceId": "occ_local", "title": "Finding", "severity": {"level": "high"}}
+            doc = {"manifest": {"scan": {"id": "s", "status": "completed"}}, "findings": {"findings": [finding]},
+                   "repositoryFindings": [dict(finding, confirmedInLatestScan=True, status="open")]}
+            real_run = d.run
+            def guarded_run(args, **kwargs):
+                if args[0] in ("gh", "glab") or args[:2] == ["git", "push"]:
+                    self.fail("Local folder workflow attempted remote publication")
+                return real_run(args, **kwargs)
+            def fake_patch(*args, **kwargs):
+                (repo / "a.py").write_text("fixed\n")
+                return {"patches": [{"occurrenceId": "occ_local", "status": "verified", "files": ["a.py"], "verification": "Fixture"}]}
+            with patch.object(d, "run", side_effect=guarded_run), patch.object(d, "json_command", side_effect=fake_patch), patch.object(d, "ensure_login", return_value=True):
+                d.publish_findings(["cli"], doc, repo, job, job, None, None, "main", publish=False)
+            diff = job / "fix-occ_local.patch"
+            self.assertIn("+fixed", diff.read_text())
+            self.assertEqual((source / "a.py").read_text(), "original\n")
+            self.assertFalse(json.loads((job / "local-fixes.json").read_text())[0]["published"])
+            d.git("apply", "--check", str(diff), cwd=source)
+
     def test_headless_detection_and_explicit_overrides(self):
         for platform in ("darwin", "win32", "linux"):
             self.assertTrue(d.use_device_auth(environment={"SSH_CONNECTION": "remote"}, platform=platform))

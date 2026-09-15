@@ -8,7 +8,7 @@ launcher/daybreak.py; platform wrappers; test_launcher.py; verify_native.py
 Official CLI 0.1.27; bundled Security plugin 0.1.95; bundled Codex 0.149.1.
 
 COMPLETED ON macOS
-17 unit/integration tests passed (python3 -m unittest discover -s launcher -p test_launcher.py -v).
+19 unit/integration tests passed (python3 -m unittest discover -s launcher -p test_launcher.py -v).
 Tests cover supported Node versions, invalid/credential-bearing repository URLs,
 API environment filtering, rejection of API/unknown login status, profile policy
 preservation and revoked-rule removal, provider-policy conflicts, literal paths,
@@ -56,3 +56,10 @@ HEADLESS LOGIN UPDATE
 Automatic SSH/headless Linux detection, explicit browser/device overrides, device
 login command dispatch, and reuse of an existing ChatGPT session passed in mocked
 authentication tests on macOS. No fresh user device login was performed by these tests.
+
+LOCAL FOLDER UPDATE — v0.1.0-preview.2
+Two regression tests passed: plain-folder snapshot preserves the original and
+excludes common credentials/links/caches; local verified fixes produce applicable
+patch files without host CLI or Git push calls. The actual Desktop extracted ZIP
+folder passed the launcher deep-mode dry-run (8 copied files, exit 0). No live model
+analysis or vulnerability finding is implied by that preflight.
