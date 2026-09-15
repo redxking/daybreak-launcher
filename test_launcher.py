@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import subprocess
 import sqlite3
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import daybreak as d
@@ -271,6 +273,132 @@ class LauncherTests(unittest.TestCase):
             (root / "a.py").write_text("changed")
             with self.assertRaises(d.SetupError):
                 d.source_details(str(root))
+
+    def test_bounded_clone_is_shallow_and_initializes_submodules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leaf, source, checkout = root / "leaf", root / "source", root / "review/repository"
+            self.init_repo(leaf)
+            (leaf / "a.py").write_text("latest leaf\n")
+            d.git("add", "a.py", cwd=leaf)
+            d.git("commit", "-m", "Second leaf commit", cwd=leaf)
+            self.init_repo(source)
+            d.git("-c", "protocol.file.allow=always", "submodule", "add", str(leaf), "deps/leaf", cwd=source)
+            d.git("commit", "-am", "Add leaf submodule", cwd=source)
+            (source / "a.py").write_text("latest source\n")
+            d.git("commit", "-am", "Second source commit", cwd=source)
+            (leaf / "a.py").write_text("newer than pinned submodule\n")
+            d.git("commit", "-am", "Advance leaf after it was pinned", cwd=leaf)
+            checkout.parent.mkdir()
+
+            d.clone_repository(source, checkout, root, branch="main", local_source=True)
+
+            self.assertEqual((checkout / "a.py").read_text(), "latest source\n")
+            self.assertEqual((checkout / "deps/leaf/a.py").read_text(), "latest leaf\n")
+            self.assertEqual(d.git("rev-list", "--count", "HEAD", cwd=checkout), "1")
+            self.assertEqual(d.git("rev-list", "--count", "HEAD", cwd=checkout / "deps/leaf"), "1")
+
+    def test_bounded_clone_rejects_submodule_count_and_removes_partial_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source, checkout = root / "source", root / "review/repository"
+            self.init_repo(source)
+            (source / ".gitmodules").write_text(
+                '[submodule "one"]\n\tpath = deps/one\n\turl = ../one.git\n'
+                '[submodule "two"]\n\tpath = deps/two\n\turl = ../two.git\n')
+            d.git("add", ".gitmodules", cwd=source)
+            d.git("commit", "-m", "Declare excessive graph", cwd=source)
+            checkout.parent.mkdir()
+
+            with patch.object(d, "SUBMODULE_MAX_COUNT", 1), self.assertRaisesRegex(d.SetupError, "more than 1 submodules"):
+                d.clone_repository(source, checkout, root, branch="main", local_source=True)
+            self.assertFalse(checkout.exists())
+
+    def test_bounded_clone_rejects_excessive_submodule_nesting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leaf, middle, source, checkout = (root / name for name in ("leaf", "middle", "source", "review/repository"))
+            self.init_repo(leaf)
+            self.init_repo(middle)
+            d.git("-c", "protocol.file.allow=always", "submodule", "add", str(leaf), "nested/leaf", cwd=middle)
+            d.git("commit", "-am", "Add nested leaf", cwd=middle)
+            self.init_repo(source)
+            d.git("-c", "protocol.file.allow=always", "submodule", "add", str(middle), "deps/middle", cwd=source)
+            d.git("commit", "-am", "Add middle submodule", cwd=source)
+            checkout.parent.mkdir()
+
+            with patch.object(d, "SUBMODULE_MAX_DEPTH", 1), self.assertRaisesRegex(d.SetupError, "nesting exceeds"):
+                d.clone_repository(source, checkout, root, branch="main", local_source=True)
+            self.assertFalse(checkout.exists())
+
+    def test_repository_storage_budget_removes_partial_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source, checkout = root / "source", root / "review/repository"
+            self.init_repo(source)
+            checkout.parent.mkdir()
+
+            with patch.object(d, "REPOSITORY_MAX_BYTES", 1), patch.object(d, "REPOSITORY_MIN_FREE_BYTES", 0), self.assertRaisesRegex(d.SetupError, "storage limit"):
+                d.clone_repository(source, checkout, root, branch="main", local_source=True)
+            self.assertFalse(checkout.exists())
+
+    def test_repository_entry_budget_removes_partial_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source, checkout = root / "source", root / "review/repository"
+            self.init_repo(source)
+            checkout.parent.mkdir()
+
+            with patch.object(d, "REPOSITORY_MAX_ENTRIES", 1), patch.object(d, "REPOSITORY_MIN_FREE_BYTES", 0), self.assertRaisesRegex(d.SetupError, "entry limit"):
+                d.clone_repository(source, checkout, root, branch="main", local_source=True)
+            self.assertFalse(checkout.exists())
+
+    def test_repository_deadline_terminates_descendant_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout, started, marker = root / "repository", root / "descendant-started", root / "descendant-survived"
+            checkout.mkdir()
+            child = "import pathlib,sys,time; time.sleep(1); pathlib.Path(sys.argv[1]).write_text('alive')"
+            parent = ("import pathlib,subprocess,sys,time; "
+                      "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
+                      "pathlib.Path(sys.argv[3]).write_text('started'); time.sleep(30)")
+            with self.assertRaisesRegex(d.SetupError, "deadline"):
+                d._repository_run([sys.executable, "-c", parent, child, str(marker), str(started)], cwd=root,
+                                  checkout=checkout, deadline=time.monotonic() + 0.5)
+            self.assertTrue(started.exists())
+            time.sleep(1.2)
+            self.assertFalse(marker.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX termination semantics")
+    def test_repository_termination_cleans_checkout_and_process_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout, started, marker = root / "repository", root / "clone-started", root / "descendant-survived"
+            child = "import pathlib,sys,time; time.sleep(1); pathlib.Path(sys.argv[1]).write_text('alive')"
+            command = ("import pathlib,subprocess,sys,time; pathlib.Path(sys.argv[1]).mkdir(); "
+                       "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[3]]); "
+                       "pathlib.Path(sys.argv[4]).write_text('started'); time.sleep(30)")
+            runner = (
+                "import daybreak as d, sys\n"
+                "real = d._repository_run\n"
+                "root, checkout, command, child, marker, started = sys.argv[1:]\n"
+                "d._repository_run = lambda args, **kwargs: real([sys.executable, '-c', command, checkout, child, marker, started], **kwargs)\n"
+                "try:\n"
+                "    d.clone_repository(root, checkout, root, branch='main', local_source=True)\n"
+                "except KeyboardInterrupt:\n"
+                "    sys.exit(130)\n")
+            process = subprocess.Popen(
+                [sys.executable, "-c", runner, str(root), str(checkout), command, child, str(marker), str(started)],
+                cwd=Path(__file__).parent)
+            for _ in range(100):
+                if started.exists():
+                    break
+                self.assertIsNone(process.poll())
+                time.sleep(0.05)
+            self.assertTrue(started.exists())
+
+            process.terminate()
+            self.assertEqual(process.wait(timeout=5), 130)
+            time.sleep(1.2)
+            self.assertFalse(marker.exists())
+            self.assertFalse(checkout.exists())
 
     def test_inherited_git_environment_cannot_redirect_commit(self):
         with tempfile.TemporaryDirectory() as tmp:

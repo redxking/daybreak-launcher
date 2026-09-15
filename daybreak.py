@@ -3,12 +3,14 @@
 import argparse
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import hashlib
 import getpass
@@ -19,6 +21,16 @@ from urllib.parse import urlsplit
 VERSION = "0.1.27"
 MODEL = "gpt-daybreak-blue-latest"
 AUTH_ROOT = None
+
+# Repository-controlled object graphs are fetched before the scanner can inspect them.
+# Keep this policy fixed and conservative so every launcher mode has the same bounds.
+REPOSITORY_CLONE_TIMEOUT_SECONDS = 10 * 60
+REPOSITORY_MAX_BYTES = 5 * 1024 ** 3
+REPOSITORY_MIN_FREE_BYTES = 1024 ** 3
+REPOSITORY_MAX_ENTRIES = 250_000
+SUBMODULE_MAX_COUNT = 64
+SUBMODULE_MAX_DEPTH = 4
+SUBMODULE_CONFIG_MAX_BYTES = 1024 ** 2
 
 # Pinned CLI routes: authentication behavior must be reviewed before adding routes.
 CLI_ROUTES = {
@@ -210,6 +222,229 @@ def run(args, *, capture=False, check=True, cwd=None, env=None, timeout=None):
         raise SetupError(f"{Path(str(args[0])).name} failed (exit {p.returncode}). "
                          + ((p.stderr or p.stdout or "").strip() if capture else "See the output above."))
     return p
+
+
+def _repository_usage(root):
+    """Return allocated bytes and entry count without following repository links."""
+    allocated = entries = 0
+    if not root.exists():
+        return allocated, entries
+    pending = [root]
+    while pending:
+        parent = pending.pop()
+        try:
+            children = os.scandir(parent)
+        except FileNotFoundError:
+            continue
+        with children:
+            for child in children:
+                entries += 1
+                try:
+                    stat = child.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                allocated += stat.st_blocks * 512 if hasattr(stat, "st_blocks") else stat.st_size
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(Path(child.path))
+                if allocated > REPOSITORY_MAX_BYTES or entries > REPOSITORY_MAX_ENTRIES:
+                    return allocated, entries
+    return allocated, entries
+
+
+def _check_repository_budget(checkout):
+    allocated, entries = _repository_usage(checkout)
+    if allocated > REPOSITORY_MAX_BYTES:
+        raise SetupError(f"Repository preparation exceeded the {REPOSITORY_MAX_BYTES // 1024 ** 3} GiB storage limit.")
+    if entries > REPOSITORY_MAX_ENTRIES:
+        raise SetupError(f"Repository preparation exceeded the {REPOSITORY_MAX_ENTRIES:,}-entry limit.")
+    volume = checkout if checkout.exists() else checkout.parent
+    if shutil.disk_usage(volume).free < REPOSITORY_MIN_FREE_BYTES:
+        raise SetupError(f"Repository preparation stopped to preserve {REPOSITORY_MIN_FREE_BYTES // 1024 ** 3} GiB of free space.")
+
+
+def _kill_process_tree(process):
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _install_repository_signal_handlers():
+    """Route ordinary termination through the acquisition cleanup path."""
+    previous = {}
+
+    def interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGHUP", "SIGTERM", "SIGQUIT"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            try:
+                previous[number] = signal.signal(number, interrupt)
+            except ValueError:
+                # Signal handlers can only be installed by the interpreter's main thread.
+                pass
+    return previous
+
+
+def _repository_run(args, *, cwd, checkout, deadline, capture=False, check=True):
+    """Run one acquisition command under the shared time, space, and process policy."""
+    _check_repository_budget(checkout)
+    if time.monotonic() >= deadline:
+        raise SetupError(f"Repository preparation exceeded the {REPOSITORY_CLONE_TIMEOUT_SECONDS}-second deadline.")
+    stdout_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") if capture else None
+    stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") if capture else None
+    popen_args = {
+        "cwd": cwd, "env": child_env(), "text": True,
+        "stdout": stdout_file, "stderr": stderr_file,
+    }
+    if os.name == "nt":
+        popen_args["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_args["start_new_session"] = True
+    process = None
+    try:
+        process = subprocess.Popen([str(a) for a in args], **popen_args)
+        next_budget_check = 0
+        while process.poll() is None:
+            now = time.monotonic()
+            if now >= deadline:
+                raise SetupError(f"Repository preparation exceeded the {REPOSITORY_CLONE_TIMEOUT_SECONDS}-second deadline.")
+            if now >= next_budget_check:
+                _check_repository_budget(checkout)
+                next_budget_check = time.monotonic() + 0.25
+            time.sleep(min(0.05, max(0, deadline - now)))
+        _check_repository_budget(checkout)
+        stdout = stderr = None
+        if capture:
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout, stderr = stdout_file.read(), stderr_file.read()
+        result = subprocess.CompletedProcess([str(a) for a in args], process.returncode, stdout, stderr)
+        if check and result.returncode:
+            raise SetupError(f"{Path(str(args[0])).name} failed (exit {result.returncode}). "
+                             + ((result.stderr or result.stdout or "").strip() if capture else "See the output above."))
+        return result
+    except BaseException:
+        if process is not None:
+            _kill_process_tree(process)
+        raise
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+            stderr_file.close()
+
+
+def _submodule_entries(repository, checkout, deadline):
+    config = repository / ".gitmodules"
+    if config.is_symlink() or config.exists() and not config.is_file():
+        raise SetupError("Each .gitmodules file must be a regular file inside the repository.")
+    if not config.exists():
+        return []
+    if config.stat().st_size > SUBMODULE_CONFIG_MAX_BYTES:
+        raise SetupError("A .gitmodules file exceeded the 1 MiB configuration limit.")
+    result = _repository_run(
+        ["git", "config", "-z", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"],
+        cwd=repository, checkout=checkout, deadline=deadline, capture=True, check=False)
+    if result.returncode == 1:
+        return []
+    if result.returncode:
+        raise SetupError("Git could not parse a repository-controlled .gitmodules file.")
+    entries = []
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        key, separator, value = record.partition("\n")
+        name = key.removeprefix("submodule.").removesuffix(".path")
+        relative = PurePosixPath(value)
+        if (not separator or not name or not value or "\\" in value or relative.is_absolute()
+                or value != relative.as_posix()
+                or any(part in ("", ".", "..", ".git") for part in relative.parts)):
+            raise SetupError("A submodule path escapes or aliases its containing repository.")
+        normalized = relative.as_posix()
+        destination = repository.joinpath(*relative.parts).resolve(strict=False)
+        if (not destination.is_relative_to(repository.resolve())
+                or any(existing_name == name or existing_path == normalized for existing_name, existing_path in entries)):
+            raise SetupError("Submodule paths must be unique descendants of their containing repository.")
+        entries.append((name, normalized))
+    return entries
+
+
+def _initialize_submodules(checkout, deadline, *, local_source):
+    pending = [(checkout, 0)]
+    count = 0
+    while pending:
+        repository, depth = pending.pop(0)
+        entries = _submodule_entries(repository, checkout, deadline)
+        if not entries:
+            continue
+        if depth >= SUBMODULE_MAX_DEPTH:
+            raise SetupError(f"Submodule nesting exceeds the {SUBMODULE_MAX_DEPTH}-level limit.")
+        count += len(entries)
+        if count > SUBMODULE_MAX_COUNT:
+            raise SetupError(f"Repository declares more than {SUBMODULE_MAX_COUNT} submodules.")
+        for name, path in entries:
+            git_policy = ["git", "-c", "submodule.recurse=false", "-c", "protocol.ext.allow=never",
+                          "-c", f"protocol.file.allow={'always' if local_source else 'never'}"]
+            _repository_run(git_policy + ["submodule", "init", "--", path], cwd=repository,
+                            checkout=checkout, deadline=deadline)
+            if local_source:
+                registered = _repository_run(["git", "config", "--get", f"submodule.{name}.url"],
+                                             cwd=repository, checkout=checkout, deadline=deadline,
+                                             capture=True).stdout.strip()
+                if Path(registered).is_absolute():
+                    _repository_run(["git", "config", f"submodule.{name}.url", Path(registered).resolve().as_uri()],
+                                    cwd=repository, checkout=checkout, deadline=deadline)
+            command = git_policy + ["submodule", "update", "--init", "--depth", "1", "--", path]
+            _repository_run(command, cwd=repository, checkout=checkout, deadline=deadline)
+            nested = repository.joinpath(*PurePosixPath(path).parts)
+            if not nested.is_dir() or not nested.resolve().is_relative_to(checkout.resolve()):
+                raise SetupError("Git placed a submodule outside the review checkout.")
+            pending.append((nested, depth + 1))
+
+
+def clone_repository(source, checkout, root, *, branch=None, local_source=False):
+    """Create a bounded, shallow source checkout and initialize bounded submodules."""
+    root = Path(root).resolve()
+    checkout = Path(checkout)
+    destination = checkout.resolve(strict=False)
+    if checkout.exists() or checkout.is_symlink() or not destination.is_relative_to(root):
+        raise SetupError("Review checkout must be a new path inside the launcher storage directory.")
+    deadline = time.monotonic() + REPOSITORY_CLONE_TIMEOUT_SECONDS
+    clone_source = Path(source).resolve().as_uri() if local_source else str(source)
+    command = ["git", "-c", "submodule.recurse=false", "-c", "protocol.ext.allow=never",
+               "clone", "--no-hardlinks", "--no-recurse-submodules", "--depth", "1",
+               "--single-branch"]
+    if local_source:
+        command += ["--no-local"]
+    if branch:
+        command += ["--branch", branch]
+    previous_handlers = _install_repository_signal_handlers()
+    try:
+        _repository_run(command + ["--", clone_source, checkout], cwd=root, checkout=checkout, deadline=deadline)
+        _initialize_submodules(checkout, deadline, local_source=local_source)
+    except BaseException as error:
+        if checkout.is_symlink():
+            checkout.unlink()
+        elif checkout.exists():
+            shutil.rmtree(checkout, ignore_errors=True)
+        if checkout.exists() or checkout.is_symlink():
+            raise SetupError("Repository preparation failed and its partial checkout could not be removed.") from error
+        raise
+    finally:
+        for number, handler in previous_handlers.items():
+            signal.signal(number, handler)
 
 
 def node_supported(version):
@@ -644,10 +879,8 @@ def main(argv=None):
     if plain_folder:
         snapshot_folder(local, checkout, job)
     else:
-        clone = ["git", "clone", "--no-hardlinks", "--recurse-submodules"]
-        if local:
-            clone += ["--branch", branch]
-        run(clone + ["--", str(local) if local else canonical, checkout], cwd=root)
+        clone_repository(str(local) if local else canonical, checkout, root,
+                         branch=branch if local else None, local_source=bool(local))
     if local and not plain_folder:
         if git("rev-parse", "HEAD", cwd=checkout) != revision or git("status", "--porcelain", cwd=local):
             raise SetupError("Source changed during preparation. Rerun after saving a stable commit.")
@@ -669,7 +902,7 @@ def main(argv=None):
     scanned_revision = git('rev-parse', 'HEAD', cwd=checkout)
     print(f"Reviewing commit {scanned_revision}")
     print(f"Checkout and results: {job}")
-    print("Git clones exclude LFS binary assets. Repository analysis may execute code with your OS permissions.")
+    print("Git clones use bounded shallow history and submodules and exclude LFS binary assets. Repository analysis may execute code with your OS permissions.")
     print("Using ChatGPT subscription authentication; account limits and Daybreak access still apply.")
     print("The CLI may display API-equivalent USD estimates. These are not a billing receipt or a measure of subscription allowance.")
     output = job / "scan-output.json"
