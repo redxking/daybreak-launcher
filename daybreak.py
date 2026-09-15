@@ -379,8 +379,15 @@ def is_git_metadata_name(name):
 def enclosing_git_metadata(local):
     """Find Git metadata at the selected directory or one of its parents without invoking Git."""
     for directory in (local, *local.parents):
-        if any(is_git_metadata_name(entry.name) for entry in directory.iterdir()):
-            return directory
+        # Probe the same named path Git uses for discovery. Listing an ancestor
+        # unnecessarily requires read permission in addition to traversal.
+        try:
+            (directory / ".git").lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SetupError(f"Cannot safely inspect Git metadata in {directory}: {exc}") from exc
+        return directory
     return None
 
 

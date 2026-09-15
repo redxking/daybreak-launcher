@@ -297,6 +297,21 @@ class LauncherTests(unittest.TestCase):
             details = d.source_details(str(nested), trust_local_git=True)
             self.assertEqual((details[0], bool(details[2]), details[3]), (root.resolve(), True, "main"))
 
+    @unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: -1)() == 0,
+                         "Requires POSIX permission enforcement for a non-root user")
+    def test_plain_folder_with_traversal_only_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "parent"
+            source = parent / "source"
+            source.mkdir(parents=True)
+            (source / "a.py").write_text("print(1)\n")
+            parent.chmod(0o111)
+            try:
+                with patch.object(d, "run", side_effect=AssertionError("plain folder must not invoke Git")):
+                    self.assertEqual(d.source_details(str(source)), (source.resolve(), None, None, None))
+            finally:
+                parent.chmod(0o700)
+
     def test_git_metadata_aliases_match_git_platform_rules(self):
         for name in (".git", ".Git", ".git. ", ".git . . .", ".git\\config", "git~1", "GIT~1...",
                      ".g\u200cit", ".\u202egit\ufeff"):
