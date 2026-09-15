@@ -19,6 +19,10 @@ from urllib.parse import urlsplit
 VERSION = "0.1.27"
 MODEL = "gpt-daybreak-blue-latest"
 AUTH_ROOT = None
+HFS_DOTGIT_IGNORABLE = frozenset({
+    0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D,
+    0x202E, 0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F, 0xFEFF,
+})
 
 # Pinned CLI routes: authentication behavior must be reviewed before adding routes.
 CLI_ROUTES = {
@@ -352,11 +356,47 @@ def git(*args, cwd=None, check=True):
     return run(["git", *args], capture=True, cwd=cwd, check=check).stdout.strip()
 
 
-def source_details(source):
+def is_git_metadata_name(name):
+    """Match Git's HFS+/NTFS-equivalent spellings of a .git path component."""
+    hfs_name = "".join(char for char in name if ord(char) not in HFS_DOTGIT_IGNORABLE)
+    if hfs_name.lower() == ".git":
+        return True
+    lower = name.lower()
+    if lower.startswith(".git"):
+        suffix = lower[4:]
+    elif lower.startswith("git~1"):
+        suffix = lower[5:]
+    else:
+        return False
+    for char in suffix:
+        if char in ":\\":
+            return True
+        if char not in " .":
+            return False
+    return True
+
+
+def enclosing_git_metadata(local):
+    """Find Git metadata at the selected directory or one of its parents without invoking Git."""
+    for directory in (local, *local.parents):
+        if any(is_git_metadata_name(entry.name) for entry in directory.iterdir()):
+            return directory
+    return None
+
+
+def source_details(source, *, trust_local_git=False):
     local = Path(source).expanduser()
     if local.exists():
         if not local.is_dir():
             raise SetupError("Select a code folder, not an individual file.")
+        local = local.resolve()
+        if not trust_local_git:
+            # Supplied Git metadata can make even read-only-looking commands execute
+            # repository-configured helpers. Do not silently reinterpret a checkout
+            # as a snapshot that could include ignored or uncommitted files.
+            if enclosing_git_metadata(local):
+                raise SetupError("The selected folder contains or is inside a Git checkout. Git metadata is not inspected automatically because its configuration can run commands. Use --trust-local-git only if you trust this checkout, or copy/export committed source without Git metadata.")
+            return local, None, None, None
         probe = run(["git", "rev-parse", "--show-toplevel"], cwd=local, capture=True, check=False)
         if probe.returncode:
             if (local / ".git").exists() or (local / ".git").is_symlink() or "not a git repository" not in probe.stderr.lower():
@@ -388,13 +428,13 @@ def snapshot_folder(source, checkout, job):
         parent = Path(parent)
         for name in list(dirs):
             path = parent / name
-            if name in skipped_dirs or path.is_symlink():
+            if name in skipped_dirs or is_git_metadata_name(name) or path.is_symlink():
                 dirs.remove(name)
                 excluded.append(path.relative_to(source).as_posix() + "/")
         for name in names:
             path = parent / name
             relative = path.relative_to(source)
-            if (path.is_symlink() or not path.is_file() or name in skipped_names
+            if (path.is_symlink() or not path.is_file() or name in skipped_names or is_git_metadata_name(name)
                     or name.endswith((".pyc", ".pyo", ".pem", ".key", ".p12", ".pfx"))
                     or (name == ".env" or name.startswith(".env.")) and name != ".env.example"):
                 excluded.append(relative.as_posix())
@@ -589,12 +629,15 @@ def publish_findings(command, document, checkout, job, root, host, remote, base_
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Set up Daybreak, review a Git repository, verify patches, and open draft requests.")
+    parser = argparse.ArgumentParser(description="Set up Daybreak, review a Git repository, verify patches, and open draft requests.",
+                                     allow_abbrev=False)
     parser.add_argument("repository", nargs="?", help="Local code folder, Git checkout, or GitHub/GitLab repository URL")
     parser.add_argument("--check", action="store_true", help="Check setup only; may install the CLI, but does not sign in or scan")
     parser.add_argument("--dry-run", action="store_true", help="Clone and validate inputs without model use, patches, or requests")
     parser.add_argument("--scan-only", action="store_true", help="Review without patching or creating requests")
     parser.add_argument("--deep", action="store_true", help="Use a longer, broader official deep scan")
+    parser.add_argument("--trust-local-git", action="store_true",
+                        help="Inspect a trusted local Git checkout before isolation; never use for supplied folders or archives")
     parser.add_argument("--capabilities", action="store_true", help="List supported official workflows and compatibility limits")
     parser.add_argument("--cli", nargs=argparse.REMAINDER, help="Run an official command with subscription safeguards; all following arguments belong to that command")
     auth = parser.add_mutually_exclusive_group()
@@ -605,7 +648,7 @@ def main(argv=None):
     if args.capabilities:
         print_capabilities()
         return 0
-    if args.cli is not None and (args.repository or args.check or args.dry_run or args.scan_only or args.deep):
+    if args.cli is not None and (args.repository or args.check or args.dry_run or args.scan_only or args.deep or args.trust_local_git):
         parser.error("Use --cli separately from launcher scan options; put official options after --cli.")
     device_auth = use_device_auth(args.device_auth)
     if sys.version_info < (3, 11):
@@ -627,7 +670,9 @@ def main(argv=None):
     source = args.repository or input("Repository folder or GitHub/GitLab URL: ").strip().strip('"')
     if not source:
         raise SetupError("A repository folder or URL is required.")
-    local, remote, revision, branch = source_details(source)
+    if args.trust_local_git and Path(source).expanduser().exists():
+        print("Trusted local Git mode: inspecting repository metadata before creating the isolated checkout.")
+    local, remote, revision, branch = source_details(source, trust_local_git=args.trust_local_git)
     plain_folder = local is not None and revision is None
     fix = not args.scan_only and not args.dry_run
     publish = fix and bool(remote)
