@@ -205,12 +205,16 @@ def configure_auth(root):
     AUTH_ROOT = root
 
 
-def run(args, *, capture=False, check=True, cwd=None, env=None, timeout=None):
+def run(args, *, capture=False, check=True, cwd=None, env=None, timeout=None, input_data=None, binary=False):
     # Never use a shell: repository names and paths remain literal arguments.
     p = subprocess.run([str(a) for a in args], cwd=cwd, env=child_env() if env is None else env,
-                       text=True, stdout=subprocess.PIPE if capture else None,
+                       input=input_data,
+                       text=not binary, stdout=subprocess.PIPE if capture else None,
                        stderr=subprocess.PIPE if capture else None, timeout=timeout)
     if check and p.returncode:
+        if binary and capture:
+            p.stderr = (p.stderr or b"").decode("utf-8", errors="replace")
+            p.stdout = (p.stdout or b"").decode("utf-8", errors="replace")
         raise SetupError(f"{Path(str(args[0])).name} failed (exit {p.returncode}). "
                          + ((p.stderr or p.stdout or "").strip() if capture else "See the output above."))
     return p
@@ -540,6 +544,58 @@ def patch_files(patch, checkout):
     return files
 
 
+def reset_repository_state(repository, revision):
+    if git("config", "--bool", "core.sparseCheckout", cwd=repository, check=False) == "true":
+        git("sparse-checkout", "disable", cwd=repository)
+    tracked = run(["git", "ls-files", "-z"], capture=True, cwd=repository, binary=True).stdout
+    if tracked:
+        for option in ("--no-assume-unchanged", "--no-skip-worktree"):
+            run(["git", "update-index", option, "-z", "--stdin"], cwd=repository, input_data=tracked, binary=True)
+    git("reset", "--hard", revision, cwd=repository)
+    git("clean", "-ffdx", cwd=repository)
+
+    flags = run(["git", "ls-files", "-v", "-z"], capture=True, cwd=repository).stdout
+    hidden = [entry for entry in flags.split("\0") if entry and (entry[0].islower() or entry[0] == "S")]
+    if (git("rev-parse", "HEAD", cwd=repository) != revision
+            or git("status", "--porcelain", "--ignored", "--untracked-files=all", cwd=repository)
+            or hidden):
+        raise SetupError("Could not reconstruct a clean checkout of the reviewed revision. No patch started.")
+
+
+def tracked_submodules(repository):
+    entries = run(["git", "ls-files", "--stage", "-z"], capture=True, cwd=repository).stdout
+    for entry in entries.split("\0"):
+        if not entry:
+            continue
+        metadata, relative = entry.split("\t", 1)
+        mode, object_name, _ = metadata.split()
+        if mode == "160000":
+            yield relative, object_name
+
+
+def reset_patch_checkout(checkout, revision):
+    """Restore all repository-visible state before a finding patch runs."""
+    reset_repository_state(checkout, revision)
+    # Deinitialization removes ignored files and independent index state inside
+    # every nested submodule before the recorded commits are reconstructed.
+    git("submodule", "deinit", "--force", "--all", cwd=checkout)
+    git("submodule", "update", "--init", "--recursive", "--force", cwd=checkout)
+
+    repositories = [checkout]
+    for repository in repositories:
+        for relative, object_name in tracked_submodules(repository):
+            submodule = (repository / relative).resolve()
+            if not submodule.is_relative_to(checkout.resolve()):
+                raise SetupError("A submodule path escaped the review checkout. No patch started.")
+            reset_repository_state(submodule, object_name)
+            repositories.append(submodule)
+    submodules = run(["git", "submodule", "status", "--recursive"], capture=True, cwd=checkout).stdout
+    if (git("rev-parse", "HEAD", cwd=checkout) != revision
+            or git("status", "--porcelain", "--ignored", "--untracked-files=all", cwd=checkout)
+            or any(line and line[0] != " " for line in submodules.splitlines())):
+        raise SetupError("Could not reconstruct a clean checkout of the reviewed revision. No patch started.")
+
+
 def pr_body(finding, patch, revision):
     locations = "\n".join(f"- `{p.get('path', '?')}:{p.get('startLine', '?')}`" for p in finding.get("locations", []))
     tests = finding.get("remediationTests") or [
@@ -561,12 +617,28 @@ def publish_findings(command, document, checkout, job, root, host, remote, base_
     revision = git("rev-parse", "HEAD", cwd=checkout)
     published = []
     print(f"{len(findings)} confirmed findings selected for individual fixes" + (" and draft requests." if publish else "; patches will remain local."), flush=True)
+    if not findings:
+        return published
+    if checkout.is_symlink() or checkout.parent.resolve() != job.resolve():
+        raise SetupError("The review checkout is not the expected isolated job repository. No patch started.")
+    if git("status", "--porcelain", cwd=checkout):
+        raise SetupError(f"Review checkout has pending changes. Inspect {checkout} before continuing.")
+    reset_patch_checkout(checkout, revision)
+    pristine = None
+    if len(findings) > 1:
+        pristine = job / "reviewed-repository"
+        if pristine.exists() or pristine.is_symlink():
+            raise SetupError("The per-finding checkout template already exists. No patch started.")
+        shutil.copytree(checkout, pristine, symlinks=True)
+    branch_bundles = []
     for index, finding in enumerate(findings, 1):
         identifier = finding["occurrenceId"]
         if not re.fullmatch(r"occ_[A-Za-z0-9_-]+", identifier):
             raise SetupError("Unexpected finding identifier; no patch started.")
-        if git("status", "--porcelain", cwd=checkout):
-            raise SetupError(f"Review checkout has pending changes. Inspect {checkout} before continuing.")
+        if index > 1:
+            shutil.rmtree(checkout)
+            shutil.copytree(pristine, checkout, symlinks=True)
+            reset_patch_checkout(checkout, revision)
         git("switch", "--detach", revision, cwd=checkout)
         branch = f"codex/daybreak-{identifier[4:20]}-{uuid.uuid4().hex[:8]}"
         git("switch", "-c", branch, cwd=checkout)
@@ -613,6 +685,10 @@ def publish_findings(command, document, checkout, job, root, host, remote, base_
                 or git("status", "--porcelain", cwd=checkout)
                 or (publish and git("remote", "get-url", "--push", "--all", "origin", cwd=checkout) != remote)):
             raise SetupError("Commit hooks changed the expected patch state or destination. No request created.")
+        if index < len(findings):
+            bundle = job / f".{identifier}-{uuid.uuid4().hex}.bundle"
+            git("bundle", "create", str(bundle), branch, cwd=checkout)
+            branch_bundles.append((branch, bundle))
         if not publish:
             diff = job / f"fix-{identifier}.patch"
             diff.write_text(git("diff", "--binary", revision, branch, cwd=checkout) + "\n", encoding="utf-8")
@@ -632,6 +708,9 @@ def publish_findings(command, document, checkout, job, root, host, remote, base_
         published.append({"finding": identifier, "branch": branch, "response": response})
         (job / "requests.json").write_text(json.dumps(published, indent=2) + "\n", encoding="utf-8")
         print(response, flush=True)
+    for branch, bundle in branch_bundles:
+        git("fetch", "--no-tags", str(bundle), f"refs/heads/{branch}:refs/heads/{branch}", cwd=checkout)
+        bundle.unlink()
     return published
 
 
