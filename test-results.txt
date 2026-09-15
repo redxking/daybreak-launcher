@@ -1,0 +1,58 @@
+Daybreak Launcher — verification record
+Author: Angelis Pseftis
+Creator: Angelis Pseftis
+Date: 2026-09-15
+
+IMPLEMENTATION UNDER TEST
+launcher/daybreak.py; platform wrappers; test_launcher.py; verify_native.py
+Official CLI 0.1.27; bundled Security plugin 0.1.95; bundled Codex 0.149.1.
+
+COMPLETED ON macOS
+17 unit/integration tests passed (python3 -m unittest discover -s launcher -p test_launcher.py -v).
+Tests cover supported Node versions, invalid/credential-bearing repository URLs,
+API environment filtering, rejection of API/unknown login status, profile policy
+preservation and revoked-rule removal, provider-policy conflicts, literal paths,
+Git environment isolation with real commits, dirty source detection, file escape
+and symlink rejection, synthetic-result rejection, PR wording, platform state path
+selection, independent per-finding branches, and blocked/redirected/unreported patches.
+
+The two-finding integration test used real local Git branches and commits.
+The model patch responses and GitHub push/PR commands were test doubles.
+It verified that both branches start at the same reviewed base and each request
+is a draft with an explicit target branch and a body file. No remote request occurred.
+
+Four native smoke checks passed (python3 launcher/verify_native.py):
+1. Launcher rejects stored synthetic API credentials as a ChatGPT session.
+2. Bundled Codex rejects API-key login under forced_login_method="chatgpt".
+   Native response: API key login is disabled. Use ChatGPT login instead.
+3. Official CLI dry-run validates a Git repository path containing spaces.
+4. Official CLI --mock output is correctly parsed and rejected for publication.
+   Its synthetic findings are fictional test data, not vulnerabilities in user code.
+
+Additionally, the actual launcher --check installed the official package in the
+user profile, listed CLI-visible installed plugins, detected ChatGPT.app, and
+reported that the separate launcher profile requires sign-in. The launcher
+--dry-run cloned a clean fixture into its review directory and completed the
+official preflight with exit 0. No model prompt was sent by those checks.
+
+NOT VERIFIED BY THESE TESTS
+Native Windows/Linux execution; recipient-specific installation/MDM policies;
+fresh interactive browser/device sign-in completion; Daybreak entitlement for a
+recipient; live model scan and patch through this launcher; actual GitHub PR or
+GitLab MR publication; independent correctness of model-reported verification;
+exhaustive security of a repository or application.
+
+REPRODUCTION
+Extract the ZIP. Install prerequisites described in README.md. From that folder:
+  python3 -m unittest test_launcher.py -v
+  python3 verify_native.py
+On Windows substitute py -3 for python3.
+
+No API model calls, credit purchases/resets, merges, or external PR/MR writes were
+performed during these launcher tests. The earlier browser-workbench evidence
+is separate and does not establish this launcher's end-to-end production readiness.
+
+HEADLESS LOGIN UPDATE
+Automatic SSH/headless Linux detection, explicit browser/device overrides, device
+login command dispatch, and reuse of an existing ChatGPT session passed in mocked
+authentication tests on macOS. No fresh user device login was performed by these tests.
