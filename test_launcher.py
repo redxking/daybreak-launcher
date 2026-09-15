@@ -350,6 +350,37 @@ class LauncherTests(unittest.TestCase):
                 d.clone_repository(source, checkout, root, branch="main", local_source=True)
             self.assertFalse(checkout.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_cleanup_signals_group_after_leader_exit(self):
+        from unittest.mock import Mock
+        process = Mock(pid=123456)
+        process.poll.return_value = 0
+        with patch.object(d.os, "killpg") as kill:
+            d._kill_process_tree(process)
+        kill.assert_called_once_with(123456, d.signal.SIGKILL)
+
+    def test_directory_walk_checks_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "file").write_text("fixture")
+            with patch.object(d.time, "monotonic", return_value=2), self.assertRaisesRegex(d.SetupError, "deadline"):
+                d._repository_usage(root, deadline=1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_exited_parent_does_not_leave_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "late-marker"
+            child = "import pathlib,sys,time; time.sleep(0.5); pathlib.Path(sys.argv[1]).write_text('late')"
+            parent = "import subprocess,sys; subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])"
+            for code in (0, 1):
+                with self.subTest(exit=code):
+                    result = d._repository_run([sys.executable, "-c", parent + ";sys.exit(" + str(code) + ")", child, str(marker)],
+                                               cwd=root, checkout=root, deadline=time.monotonic() + 5, check=False)
+                    self.assertEqual(result.returncode, code)
+                    time.sleep(0.7)
+                    self.assertFalse(marker.exists())
+
     def test_repository_deadline_terminates_descendant_process(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

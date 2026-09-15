@@ -224,13 +224,19 @@ def run(args, *, capture=False, check=True, cwd=None, env=None, timeout=None):
     return p
 
 
-def _repository_usage(root):
+def _check_deadline(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise SetupError(f"Repository preparation exceeded the {REPOSITORY_CLONE_TIMEOUT_SECONDS}-second deadline.")
+
+
+def _repository_usage(root, deadline=None):
     """Return allocated bytes and entry count without following repository links."""
     allocated = entries = 0
     if not root.exists():
         return allocated, entries
     pending = [root]
     while pending:
+        _check_deadline(deadline)
         parent = pending.pop()
         try:
             children = os.scandir(parent)
@@ -238,6 +244,7 @@ def _repository_usage(root):
             continue
         with children:
             for child in children:
+                _check_deadline(deadline)
                 entries += 1
                 try:
                     stat = child.stat(follow_symlinks=False)
@@ -251,21 +258,21 @@ def _repository_usage(root):
     return allocated, entries
 
 
-def _check_repository_budget(checkout):
-    allocated, entries = _repository_usage(checkout)
+def _check_repository_budget(checkout, deadline=None):
+    allocated, entries = _repository_usage(checkout, deadline)
     if allocated > REPOSITORY_MAX_BYTES:
         raise SetupError(f"Repository preparation exceeded the {REPOSITORY_MAX_BYTES // 1024 ** 3} GiB storage limit.")
     if entries > REPOSITORY_MAX_ENTRIES:
         raise SetupError(f"Repository preparation exceeded the {REPOSITORY_MAX_ENTRIES:,}-entry limit.")
     volume = checkout if checkout.exists() else checkout.parent
     if shutil.disk_usage(volume).free < REPOSITORY_MIN_FREE_BYTES:
-        raise SetupError(f"Repository preparation stopped to preserve {REPOSITORY_MIN_FREE_BYTES // 1024 ** 3} GiB of free space.")
+        raise SetupError(f"Repository preparation detected free space below {REPOSITORY_MIN_FREE_BYTES // 1024 ** 3} GiB of free space.")
 
 
 def _kill_process_tree(process):
-    if process.poll() is not None:
-        return
     if os.name == "nt":
+        # taskkill cannot reliably recover descendants after their leader exits.
+        # Native Windows qualification is still required for this cleanup path.
         subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
@@ -300,7 +307,7 @@ def _install_repository_signal_handlers():
 
 def _repository_run(args, *, cwd, checkout, deadline, capture=False, check=True):
     """Run one acquisition command under the shared time, space, and process policy."""
-    _check_repository_budget(checkout)
+    _check_repository_budget(checkout, deadline)
     if time.monotonic() >= deadline:
         raise SetupError(f"Repository preparation exceeded the {REPOSITORY_CLONE_TIMEOUT_SECONDS}-second deadline.")
     stdout_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") if capture else None
@@ -322,10 +329,14 @@ def _repository_run(args, *, cwd, checkout, deadline, capture=False, check=True)
             if now >= deadline:
                 raise SetupError(f"Repository preparation exceeded the {REPOSITORY_CLONE_TIMEOUT_SECONDS}-second deadline.")
             if now >= next_budget_check:
-                _check_repository_budget(checkout)
+                _check_repository_budget(checkout, deadline)
+                _check_deadline(deadline)
                 next_budget_check = time.monotonic() + 0.25
             time.sleep(min(0.05, max(0, deadline - now)))
-        _check_repository_budget(checkout)
+        # A process group may outlive its original leader, including on success.
+        _kill_process_tree(process)
+        _check_repository_budget(checkout, deadline)
+        _check_deadline(deadline)
         stdout = stderr = None
         if capture:
             stdout_file.seek(0)
