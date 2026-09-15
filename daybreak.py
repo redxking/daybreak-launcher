@@ -12,11 +12,124 @@ import tempfile
 import uuid
 import hashlib
 import getpass
+import sqlite3
+from contextlib import closing
 from urllib.parse import urlsplit
 
 VERSION = "0.1.27"
 MODEL = "gpt-daybreak-blue-latest"
 AUTH_ROOT = None
+
+# Pinned CLI routes: authentication behavior must be reviewed before adding routes.
+CLI_ROUTES = {
+    "info": "read", "export": "read", "findings": "read",
+    "scans list": "read", "scans show": "read", "scans logs": "read",
+    "import github": "read", "scan import": "write", "publish check": "read",
+    "scan": "model", "policy": "model", "scan-components": "model",
+    "patch": "model", "validate": "model", "verify-fix": "model",
+    "scans resume": "saved", "scans rerun": "saved",
+    "findings false-positive": "write", "publish scan": "write",
+    "logout": "write", "login status": "read",
+}
+CLI_LIMITATIONS = {
+    "bulk-scan": "No explicit authentication selector; recovery settings need separate qualification.",
+    "classify-severity": "No explicit authentication selector in this CLI version.",
+    "scans match / compare": "Model-assisted matching has no explicit authentication/model selectors.",
+    "dedupe": "Uses other named models internally; cannot promise Daybreak-only analysis.",
+    "serve": "Separate hosted service; defaults to an API embeddings endpoint.",
+    "install-hook": "Future hook executions need independent authentication/model enforcement.",
+    "feedback": "Sends feedback externally; use the official tool deliberately.",
+    "mcp / skills / completions": "Agent and shell integration requires a separate setup workflow.",
+}
+
+
+def print_capabilities():
+    print(f"Official CLI {VERSION}: launcher capability catalog")
+    for name, kind in CLI_ROUTES.items():
+        print(f"  {name}: available ({kind})")
+    for name, reason in CLI_LIMITATIONS.items():
+        print(f"  {name}: not enabled — {reason}")
+    print("Use --cli COMMAND --help for official options. Use --device-auth before --cli for headless login.")
+
+
+def cli_route(arguments):
+    if not arguments or arguments == ["--help"]:
+        return [], "help"
+    # Only the command path is used when requesting help; discard other inputs.
+    path = arguments[:2] if arguments[0] in {"scans", "import", "publish", "login"} else arguments[:1]
+    if arguments[:2] in (["findings", "false-positive"], ["scan", "import"]):
+        path = arguments[:2]
+    if any(x in ("--help", "-h") for x in arguments):
+        return [x for x in path if not x.startswith("-")], "help"
+    kind = CLI_ROUTES.get(" ".join(path))
+    if kind is None:
+        raise SetupError("This command is not enabled in the subscription-only launcher. Run --capabilities for its status, or --cli COMMAND --help for official documentation.")
+    return path, kind
+
+
+def check_saved_recipe(root, identifier):
+    if not re.fullmatch(r"[a-fA-F0-9-]{8,36}", identifier):
+        raise SetupError("Supply a saved scan ID or unique prefix of at least eight characters.")
+    db = root / "security-state/workbench.sqlite3"
+    if not db.is_file():
+        raise SetupError("No saved scan history exists in this launcher profile.")
+    with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)) as connection:
+        rows = connection.execute("SELECT id, recipe_json FROM scans WHERE id LIKE ?", (identifier + "%",)).fetchall()
+    if len(rows) != 1:
+        raise SetupError("Scan ID was not found or is ambiguous. Use --cli scans list.")
+    recipe = json.loads(rows[0][1] or "null")
+    config = recipe.get("config", {}) if isinstance(recipe, dict) else {}
+    allowed = {"model", "model_reasoning_effort", "model_reasoning_summary", "approval_policy", "features", "sandbox_mode", "analytics"}
+    if (not isinstance(config, dict) or config.get("model") != MODEL or set(config) - allowed
+            or recipe.get("mock") or recipe.get("pluginPath") or recipe.get("provider") not in (None, "openai")):
+        raise SetupError("Saved scan configuration is not a qualified Daybreak recipe. Start a new subscription-authenticated scan instead.")
+    return rows[0][0]
+
+
+def official_command(command, arguments, root, *, device=False):
+    path, kind = cli_route(arguments)
+    if kind == "help":
+        return run(command + path + ["--help"], env=security_env(), check=False).returncode
+    schema = json.loads(run(command + path + ["--schema", "--format", "json"],
+                            capture=True, env=security_env()).stdout)
+    properties = schema.get("options", {}).get("properties", {})
+    # Pin credentials/model and disallow configuration or executable substitution.
+    forbidden = {"auth", "provider", "model", "codex", "plugin-path", "python", "mcp", "llms", "llms-full", "schema"}
+    allowed_options = {re.sub(r"(?<!^)(?=[A-Z])", "-", key).lower() for key in properties}
+    allowed_options |= {"format", "filter-output", "full-output", "token-count", "token-limit", "token-offset"}
+    for arg in arguments[len(path):]:
+        if arg.startswith("-"):
+            name = arg.split("=", 1)[0].lstrip("-")
+            if arg == "--" or name in forbidden or name not in allowed_options or not arg.startswith("--"):
+                raise SetupError(f"Option {arg.split('=', 1)[0]} is managed by the launcher or unsupported. Use --cli COMMAND --help.")
+    extra = []
+    if path == ["scans", "list"] and (len(arguments) == 2 or arguments[2].startswith("--")):
+        if not any(a.split("=", 1)[0] == "--scan-root" for a in arguments):
+            extra += ["--scan-root", str(root)]
+    if path == ["patch"] and any(a.split("=", 1)[0] == "--resume-pr" for a in arguments[1:]):
+        # Native publication resume forbids auth/model overrides and runs no patch model.
+        if not (len(arguments) == 3 and arguments[1] == "--resume-pr" and not arguments[2].startswith("-")):
+            raise SetupError("Use exactly --cli patch --resume-pr BRANCH to retry publication without patching again.")
+        kind = "write"
+    if kind == "model":
+        if "auth" not in properties:
+            raise SetupError("CLI authentication contract changed; refusing model execution.")
+        extra += ["--auth", "chatgpt"]
+        if "model" in properties:
+            extra += ["--model", MODEL, "--provider", "openai"]
+        elif "codex" in properties:
+            extra += ["--codex", f'model="{MODEL}"']
+        else:
+            raise SetupError("CLI model-selection contract changed; refusing model execution.")
+    if kind == "saved":
+        if len(arguments) <= len(path) or arguments[len(path)].startswith("-"):
+            raise SetupError("Resume/rerun requires an explicit scan ID immediately after the command.")
+        arguments = list(arguments)
+        arguments[len(path)] = check_saved_recipe(root, arguments[len(path)])
+    if kind in {"model", "saved"}:
+        ensure_login(command, root, device=device)
+        print("Using ChatGPT authentication and Daybreak Blue. Advanced commands use the supplied working directory; they do not create the launcher's protective copy.", flush=True)
+    return run(command + list(arguments) + extra, env=security_env(), check=False).returncode
 
 
 class SetupError(RuntimeError):
@@ -482,11 +595,18 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="Clone and validate inputs without model use, patches, or requests")
     parser.add_argument("--scan-only", action="store_true", help="Review without patching or creating requests")
     parser.add_argument("--deep", action="store_true", help="Use a longer, broader official deep scan")
+    parser.add_argument("--capabilities", action="store_true", help="List supported official workflows and compatibility limits")
+    parser.add_argument("--cli", nargs=argparse.REMAINDER, help="Run an official command with subscription safeguards; all following arguments belong to that command")
     auth = parser.add_mutually_exclusive_group()
     auth.add_argument("--device-auth", "--headless", dest="device_auth", action="store_true", default=None,
                       help="Use ChatGPT device sign-in; selected automatically over SSH or on Linux without a display")
     auth.add_argument("--browser-auth", dest="device_auth", action="store_false", help="Use local browser sign-in instead of automatic device detection")
     args = parser.parse_args(argv)
+    if args.capabilities:
+        print_capabilities()
+        return 0
+    if args.cli is not None and (args.repository or args.check or args.dry_run or args.scan_only or args.deep):
+        parser.error("Use --cli separately from launcher scan options; put official options after --cli.")
     device_auth = use_device_auth(args.device_auth)
     if sys.version_info < (3, 11):
         raise SetupError("This launcher requires Python 3.11 or newer: https://www.python.org/downloads/")
@@ -497,6 +617,8 @@ def main(argv=None):
     root = private_root()
     command = runtime(root)
     configure_auth(root)
+    if args.cli is not None:
+        return official_command(command, args.cli, root, device=device_auth)
     logged_in = ensure_login(command, root, check_only=args.check or args.dry_run, device=device_auth)
     print("Account training/retention settings: not exposed by CLI; review your account/workspace Data Controls.")
     if args.check:

@@ -34,6 +34,16 @@ def main():
         assert p.returncode != 0 and "API key login is disabled" in p.stdout + p.stderr, p.stderr
         print("PASS: bundled native runtime rejects API-key sign-in under forced ChatGPT configuration")
         auth.unlink(missing_ok=True)
+        for route, kind in d.CLI_ROUTES.items():
+            schema = json.loads(d.run(command + route.split() + ["--schema", "--format", "json"],
+                                      capture=True, env=d.security_env()).stdout)
+            options = schema.get("options", {}).get("properties", {})
+            if kind == "model":
+                assert "auth" in options and ("model" in options or "codex" in options), route
+        print("PASS: enabled command routes match installed native schemas and model/auth selectors")
+        assert d.official_command(command, ["scans", "list", "--format", "json"], root) == 0
+        assert d.official_command(command, ["scans", "resume", "--help"], root) == 0
+        print("PASS: advanced history and resume help execute without login or model use")
         repo = root / "source with spaces"
         repo.mkdir()
         d.git("init", "-b", "main", str(repo))

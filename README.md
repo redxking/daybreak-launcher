@@ -8,7 +8,7 @@ creator: Angelis Pseftis
 
 Review a repository with Daybreak Blue, generate fixes, and create one draft GitHub pull request or GitLab merge request per verified finding. The launcher uses the official Codex Security CLI; it does not require the earlier browser workbench.
 
-**Experimental preview.** [Download the launcher ZIP](https://github.com/redxking/daybreak-launcher/releases/download/v0.1.0-preview.2/Daybreak-Launcher.zip) or read the [release notes](https://github.com/redxking/daybreak-launcher/releases/tag/v0.1.0-preview.2). This is an independent launcher, not an official OpenAI product.
+**Experimental preview.** [Download the launcher ZIP](https://github.com/redxking/daybreak-launcher/releases/download/v0.1.0-preview.3/Daybreak-Launcher.zip) or read the [release notes](https://github.com/redxking/daybreak-launcher/releases/tag/v0.1.0-preview.3). This is an independent launcher, not an official OpenAI product.
 
 **Public repository disclosure:** the default workflow pushes fix branches and opens draft requests automatically. On a public repository, those changes and vulnerability explanations are public before a fix is merged. Use `--scan-only` when findings need private review or coordinated disclosure first. Draft status does not make a request private.
 
@@ -58,6 +58,56 @@ python3 daybreak.py https://github.com/OWNER/REPOSITORY --deep --device-auth
 
 On Windows, substitute `py -3` for `python3`. iPhone/iPad cannot run this local launcher; use a supported remote development machine instead.
 
+## More workflows
+
+Run `python3 daybreak.py --capabilities` for the complete launcher support catalog. It does not install tools, sign in, or consume model usage. `--cli` opens the official command interface with the launcher's subscription safeguards. Everything after `--cli` belongs to the official command. Put `--device-auth` before `--cli` when needed.
+
+```sh
+python3 daybreak.py --cli --help
+python3 daybreak.py --cli scans list
+python3 daybreak.py --cli scans show SCAN_ID
+python3 daybreak.py --cli scans logs SCAN_ID
+python3 daybreak.py --device-auth --cli scans resume SCAN_ID
+python3 daybreak.py --cli scans rerun SCAN_ID
+python3 daybreak.py --cli export SCAN_ID --export-format sarif --output findings.sarif
+python3 daybreak.py --cli patch OCCURRENCE_ID --scan SCAN_ID
+python3 daybreak.py --cli verify-fix --scan SCAN_ID
+python3 daybreak.py --cli scan --help
+```
+
+`scans list` includes this launcher's review directories by default. Supply a repository argument or `--scan-root` to select a different scope. Use explicit scan IDs for show/logs/export when working outside the reviewed checkout; native defaults otherwise follow the current directory. Logs may include source and command output: inspect them before sharing.
+
+**Advanced commands operate in the current directory or on the supplied target.** They do not automatically clone, copy, or create one branch per finding. Use the original repository-argument workflow for those protections. A direct `patch --create-pr` follows the official CLI's publication behavior. `patch --resume-pr BRANCH` retries a previously prepared request without running the patch model again; run it from the original patch checkout, without additional options.
+
+| Workflow | Launcher access |
+|---|---|
+| Standard/deep, paths, diffs, working-tree changes, instructions, worker limits | `--cli scan` with official options |
+| Component planning and component scans | `--cli scan-components` |
+| Draft repository security policy | `--cli policy` |
+| Validate a reported problem; patch; verify an existing fix; assess patch risk | `--cli validate`, `patch`, `verify-fix`; patch supports `--assess-patch-risk` |
+| History, reports, activity, deep resume, rerun | `--cli scans list/show/logs/resume/rerun` |
+| Import GitHub alerts or existing CSV/JSON findings | `--cli import github`; `--cli scan import` |
+| Findings, false-positive triage, exports | `--cli findings`, `findings false-positive`, `export` |
+| Publish findings to Linear or a custom findings service | `--cli publish check/scan`; requires that destination's credentials |
+| Account status/logout and installed engine metadata | `--cli login status`, `logout`, `info` |
+
+Use `--cli COMMAND --help` for exact parameters; for example, `--cli scan-components --help`. Importing findings does not validate them. Publication sends findings to the selected destination; check the official `--dry-run` option before sending. Jira is not a native publication destination in the pinned CLI. GitHub/GitLab draft code requests use the patch workflow.
+
+### Reusing previous work
+
+A new `--deep` run starts a new analysis; it does not automatically extend a completed standard scan. Native `scans resume` retains an interrupted deep scan's completed workers, artifacts, and session. It requires the original checkout, unchanged reviewed source, saved session, and compatible running scan state. Do not resume a scan that is still executing. The launcher checks the saved recipe's model/configuration and active ChatGPT login; the official CLI checks resume eligibility. `scans rerun` starts another scan using the saved recipe. Neither command changes a standard scan into a deep scan.
+
+### Capabilities with compatibility limits
+
+The catalog includes the entire official command surface, but does not claim every route is qualified for subscription-only Daybreak execution. These commands remain disabled for execution through `--cli`; their official help is available:
+
+- Bulk scans, severity reclassification, and model-assisted scan matching/comparison need separate authentication/model qualification because the pinned commands lack explicit selectors.
+- Deduplication uses other named models internally. The hosted `serve` command defaults to an API embeddings endpoint.
+- Pre-commit hooks, MCP/skill installation, and shell completions require a separate integration workflow. The CLI's MCP integration exposes metadata, not a complete scanning server.
+- Feedback sends information to OpenAI and remains outside this launcher workflow.
+
+Model/provider/authentication overrides, alternative plugins/interpreters, and unrecognized option aliases are rejected. Model commands use explicit ChatGPT authentication and Daybreak; saved-scan recovery checks the retained configuration first. This preserves the subscription-only constraint instead of offering an unrestricted CLI passthrough. Destination credentials for GitHub, GitLab, Linear, and custom services are separate from model authentication.
+
 ## What it checks and changes
 
 - Detects desktop apps in common installation locations and lists installed/enabled Codex plugins when the CLI can report them. Detection is advisory; a portable/custom app location may be missed. Neither the desktop app nor separate Security plugin installation is required because the official CLI bundles that plugin.
@@ -96,7 +146,7 @@ The CLI is pinned to **0.1.27**. Update that pin only after checking authenticat
 
 ## Verification
 
-On macOS, 19 unit/integration tests and four native CLI smoke checks passed. Windows/Linux branches require native qualification before broad distribution. A dry run checks preparation, not model entitlement, scan quality, vulnerability reproduction, or actual PR publication. See the accompanying `test-results.txt` for the completed checks and their boundaries.
+On macOS, the original scan workflow and advanced command routing have unit/integration and native CLI smoke coverage. Windows/Linux branches require native qualification before broad distribution. A dry run checks preparation, not model entitlement, scan quality, vulnerability reproduction, or actual PR publication. See the accompanying `test-results.txt` for exact completed checks and their boundaries.
 
 To repeat the tests from the extracted folder:
 

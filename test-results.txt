@@ -63,3 +63,19 @@ excludes common credentials/links/caches; local verified fixes produce applicabl
 patch files without host CLI or Git push calls. The actual Desktop extracted ZIP
 folder passed the launcher deep-mode dry-run (8 copied files, exit 0). No live model
 analysis or vulnerability finding is implied by that preflight.
+
+ADVANCED COMMAND UPDATE — v0.1.0-preview.3
+29 unit/integration tests passed on macOS. Added no-setup capability discovery,
+advanced dispatch without default scanning, schema-aware option validation,
+explicit ChatGPT/Daybreak injection, rejection of native option aliases and
+configuration overrides, read-only history, safe saved-recipe selection,
+ambiguous scan-ID refusal, and publication-only PR resume dispatch.
+
+Six native smoke groups passed with the pinned CLI: the original four groups
+plus schema checks for every enabled command route and real advanced history/
+resume-help execution without sign-in or model use. Disabled command families
+are documented in the capability catalog rather than claimed as supported.
+
+Live advanced model operations, interrupted deep-scan recovery, external finding
+publication, and Windows/Linux execution have not been exercised by these tests.
+The user's separate ongoing security scan was not restarted or changed.

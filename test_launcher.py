@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,6 +13,89 @@ import daybreak as d
 
 
 class LauncherTests(unittest.TestCase):
+    def test_capabilities_requires_no_setup(self):
+        with patch.object(d, "runtime", side_effect=AssertionError("must not install")), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(d.main(["--capabilities"]), 0)
+        self.assertIn("scans resume", output.getvalue())
+        self.assertIn("dedupe: not enabled", output.getvalue())
+
+    def test_cli_routes_refuse_unqualified_execution_but_allow_help(self):
+        for args in (["serve"], ["dedupe"], ["bulk-scan", "repos.csv"], ["login", "--with-api-key"], ["scans", "compare"]):
+            with self.assertRaises(d.SetupError): d.cli_route(args)
+        self.assertEqual(d.cli_route(["serve", "--help"]), (["serve"], "help"))
+        self.assertEqual(d.cli_route(["scans", "resume", "12345678"])[1], "saved")
+        self.assertEqual(d.cli_route(["scan", "import", "--json", "findings.json"]), (["scan", "import"], "write"))
+
+    def test_cli_dispatch_never_starts_default_scan(self):
+        with patch.object(d, "desktop_status"), patch.object(d.shutil, "which", return_value="git"), patch.object(d, "private_root", return_value=Path("/tmp")), patch.object(d, "runtime", return_value=["cli"]), patch.object(d, "configure_auth"), patch.object(d, "official_command", return_value=0) as official, patch.object(d, "source_details", side_effect=AssertionError("must not select a source")), patch.object(d, "ensure_login", side_effect=AssertionError("history needs no login")):
+            self.assertEqual(d.main(["--device-auth", "--cli", "scans", "list"]), 0)
+            official.assert_called_once_with(["cli"], ["scans", "list"], Path("/tmp"), device=True)
+
+    def test_cli_metadata_schema_without_options(self):
+        with patch.object(d, "security_env", return_value={}), patch.object(d, "run") as run:
+            run.side_effect = [subprocess.CompletedProcess([], 0, '{}'), subprocess.CompletedProcess([], 0)]
+            self.assertEqual(d.official_command(["cli"], ["info"], Path("/tmp")), 0)
+
+    def test_cli_enforces_auth_and_model_without_shell(self):
+        schema = {"options": {"properties": {"auth": {}, "model": {}, "provider": {}, "mode": {}}}}
+        with patch.object(d, "security_env", return_value={}), patch.object(d, "ensure_login") as login, patch.object(d, "run") as run:
+            run.side_effect = [subprocess.CompletedProcess([], 0, json.dumps(schema)), subprocess.CompletedProcess([], 0)]
+            self.assertEqual(d.official_command(["node", "cli"], ["scan", "/repo with spaces", "--mode", "deep"], Path("/tmp")), 0)
+            executed = run.call_args.args[0]
+            self.assertEqual(executed[-6:], ["--auth", "chatgpt", "--model", d.MODEL, "--provider", "openai"])
+            self.assertIn("/repo with spaces", executed)
+            login.assert_called_once()
+
+    def test_cli_patch_pins_model_with_codex_override(self):
+        schema = {"options": {"properties": {"auth": {}, "codex": {}, "scan": {}}}}
+        with patch.object(d, "security_env", return_value={}), patch.object(d, "ensure_login"), patch.object(d, "run") as run:
+            run.side_effect = [subprocess.CompletedProcess([], 0, json.dumps(schema)), subprocess.CompletedProcess([], 7)]
+            self.assertEqual(d.official_command(["cli"], ["patch", "occ_1", "--scan", "scan_1"], Path("/tmp")), 7)
+            self.assertEqual(run.call_args.args[0][-4:], ["--auth", "chatgpt", "--codex", f'model="{d.MODEL}"'])
+
+    def test_cli_rejects_auth_model_and_executable_overrides(self):
+        schema = {"options": {"properties": {"auth": {}, "model": {}}}}
+        for option in ("--auth=api-key", "--provider", "--model", "--codex", "--plugin-path", "--python", "--mcp", "--", "-m", "--pluginPath", "--unknown"):
+            with self.subTest(option=option), patch.object(d, "security_env", return_value={}), patch.object(d, "ensure_login") as login, patch.object(d, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(schema))) as run:
+                with self.assertRaises(d.SetupError): d.official_command(["cli"], ["scan", ".", option], Path("/tmp"))
+                self.assertEqual(run.call_count, 1)  # schema only, never execute scan
+                login.assert_not_called()
+
+    def test_cli_history_does_not_login_or_select_repository(self):
+        schema = {"options": {"properties": {}}}
+        with patch.object(d, "security_env", return_value={}), patch.object(d, "ensure_login") as login, patch.object(d, "run") as run:
+            run.side_effect = [subprocess.CompletedProcess([], 0, json.dumps(schema)), subprocess.CompletedProcess([], 0)]
+            d.official_command(["cli"], ["scans", "list", "--format", "json"], Path("/tmp"))
+            login.assert_not_called()
+            self.assertEqual(run.call_args.args[0], ["cli", "scans", "list", "--format", "json", "--scan-root", "/tmp"])
+
+    def test_publication_resume_does_not_repatch_or_inject_auth(self):
+        schema = {"options": {"properties": {"auth": {}, "codex": {}, "resumePr": {}, "scan": {}}}}
+        with patch.object(d, "security_env", return_value={}), patch.object(d, "ensure_login") as login, patch.object(d, "run") as run:
+            run.side_effect = [subprocess.CompletedProcess([], 0, json.dumps(schema)), subprocess.CompletedProcess([], 0)]
+            d.official_command(["cli"], ["patch", "--resume-pr", "codex/fix"], Path("/tmp"))
+            self.assertEqual(run.call_args.args[0], ["cli", "patch", "--resume-pr", "codex/fix"])
+            login.assert_not_called()
+
+    def test_saved_recipe_validation_and_ambiguous_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / "security-state").mkdir()
+            connection = sqlite3.connect(root / "security-state/workbench.sqlite3")
+            connection.execute("CREATE TABLE scans (id TEXT, recipe_json TEXT)")
+            def save(recipe, identifier="abcdef01-1111"):
+                connection.execute("DELETE FROM scans")
+                connection.execute("INSERT INTO scans VALUES (?, ?)", (identifier, json.dumps(recipe))); connection.commit()
+            good = {"config": {"model": d.MODEL, "approval_policy": "on-request"}, "mode": "deep"}
+            save(good)
+            self.assertEqual(d.check_saved_recipe(root, "abcdef01"), "abcdef01-1111")
+            for bad in ({"config": {"model": "other"}}, {"config": {"model": d.MODEL, "model_providers": {}}}, dict(good, mock=True), None):
+                save(bad)
+                with self.assertRaises(d.SetupError): d.check_saved_recipe(root, "abcdef01")
+            save(good)
+            connection.execute("INSERT INTO scans VALUES (?, ?)", ("abcdef01-2222", json.dumps(good))); connection.commit()
+            with self.assertRaises(d.SetupError): d.check_saved_recipe(root, "abcdef01")
+            connection.close()
+
     def test_plain_folder_snapshot_excludes_secrets_and_preserves_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             source, job = Path(tmp) / "folder with spaces", Path(tmp) / "job"
