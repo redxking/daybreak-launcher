@@ -26,6 +26,10 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(d.cli_route(["scans", "resume", "12345678"])[1], "saved")
         self.assertEqual(d.cli_route(["scan", "import", "--json", "findings.json"]), (["scan", "import"], "write"))
 
+    def test_trust_local_git_requires_full_option_name(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            d.main(["--trust", "--capabilities"])
+
     def test_cli_dispatch_never_starts_default_scan(self):
         with patch.object(d, "desktop_status"), patch.object(d.shutil, "which", return_value="git"), patch.object(d, "private_root", return_value=Path("/tmp")), patch.object(d, "runtime", return_value=["cli"]), patch.object(d, "configure_auth"), patch.object(d, "official_command", return_value=0) as official, patch.object(d, "source_details", side_effect=AssertionError("must not select a source")), patch.object(d, "ensure_login", side_effect=AssertionError("history needs no login")):
             self.assertEqual(d.main(["--device-auth", "--cli", "scans", "list"]), 0)
@@ -102,6 +106,8 @@ class LauncherTests(unittest.TestCase):
             source.mkdir(); job.mkdir()
             (source / "main.py").write_text("original\n")
             (source / ".gitignore").write_text("main.py\n")
+            (source / "module").mkdir()
+            (source / "module/.Git").write_text("gitdir: attacker-controlled-metadata\n")
             (source / ".env").write_text("synthetic secret")
             (source / "__pycache__").mkdir()
             (source / "outside").symlink_to(job, target_is_directory=True)
@@ -109,14 +115,16 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(details, (source.resolve(), None, None, None))
             checkout = job / "repository"
             d.snapshot_folder(source, checkout, job)
-            self.assertFalse((source / ".git").exists())
+            self.assertNotIn(".git", {path.name for path in source.iterdir()})
             self.assertEqual((source / "main.py").read_text(), "original\n")
             self.assertFalse((checkout / ".env").exists())
+            self.assertFalse((checkout / "module/.Git").exists())
             self.assertFalse((checkout / "outside").exists())
             self.assertIn("main.py", d.git("ls-files", cwd=checkout))
             self.assertEqual(d.git("status", "--porcelain", cwd=checkout), "")
             manifest = json.loads((job / "source-snapshot.json").read_text())
             self.assertIn(".env", manifest["excluded"])
+            self.assertIn("module/.Git", manifest["excluded"])
 
     def test_local_fix_saved_without_host_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -266,11 +274,52 @@ class LauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo with spaces"
             self.init_repo(root)
-            details = d.source_details(str(root))
+            details = d.source_details(str(root), trust_local_git=True)
             self.assertEqual(details[0], root.resolve())
             (root / "a.py").write_text("changed")
             with self.assertRaises(d.SetupError):
-                d.source_details(str(root))
+                d.source_details(str(root), trust_local_git=True)
+
+    def test_local_git_metadata_requires_explicit_trust(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "supplied-repo"
+            self.init_repo(root)
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "tracked.py").write_text("tracked\n")
+            d.git("add", "nested/tracked.py", cwd=root)
+            d.git("commit", "-m", "Nested fixture", cwd=root)
+            d.git("config", "core.fsmonitor", "attacker-controlled-command", cwd=root)
+            for selected in (root, nested):
+                with self.subTest(selected=selected), patch.object(d, "run", side_effect=AssertionError("untrusted local metadata must not reach Git")), self.assertRaisesRegex(d.SetupError, "--trust-local-git"):
+                    d.source_details(str(selected))
+            d.git("config", "--unset", "core.fsmonitor", cwd=root)
+            details = d.source_details(str(nested), trust_local_git=True)
+            self.assertEqual((details[0], bool(details[2]), details[3]), (root.resolve(), True, "main"))
+
+    @unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: -1)() == 0,
+                         "Requires POSIX permission enforcement for a non-root user")
+    def test_plain_folder_with_traversal_only_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "parent"
+            source = parent / "source"
+            source.mkdir(parents=True)
+            (source / "a.py").write_text("print(1)\n")
+            parent.chmod(0o111)
+            try:
+                with patch.object(d, "run", side_effect=AssertionError("plain folder must not invoke Git")):
+                    self.assertEqual(d.source_details(str(source)), (source.resolve(), None, None, None))
+            finally:
+                parent.chmod(0o700)
+
+    def test_git_metadata_aliases_match_git_platform_rules(self):
+        for name in (".git", ".Git", ".git. ", ".git . . .", ".git\\config", "git~1", "GIT~1...",
+                     ".g\u200cit", ".\u202egit\ufeff"):
+            with self.subTest(name=name):
+                self.assertTrue(d.is_git_metadata_name(name))
+        for name in (".github", ".gitignore", "git~2", "legitimate.git"):
+            with self.subTest(name=name):
+                self.assertFalse(d.is_git_metadata_name(name))
 
     def test_inherited_git_environment_cannot_redirect_commit(self):
         with tempfile.TemporaryDirectory() as tmp:
