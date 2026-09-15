@@ -302,6 +302,20 @@ class LauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp); repo = job / "repository"
             self.init_repo(repo)
+            submodule = job / "submodule"
+            self.init_repo(submodule)
+            (submodule / ".gitignore").write_text("cache/\n")
+            (submodule / "extra.py").write_text("committed\n")
+            d.git("add", ".gitignore", "extra.py", cwd=submodule)
+            d.git("commit", "-m", "Ignore fixture cache", cwd=submodule)
+            (repo / ".gitignore").write_text("ignored/\n")
+            (repo / "hidden.py").write_text("committed\n")
+            (repo / "skipped.py").write_text("committed\n")
+            d.git("-c", "protocol.file.allow=always", "submodule", "add", "--", str(submodule), "vendor/submodule", cwd=repo)
+            d.git("add", ".gitignore", "hidden.py", "skipped.py", cwd=repo)
+            d.git("commit", "-m", "Add isolation fixtures", cwd=repo)
+            d.git("sparse-checkout", "init", "--no-cone", cwd=repo / "vendor/submodule")
+            d.git("sparse-checkout", "set", "--no-cone", "a.py", cwd=repo / "vendor/submodule")
             base = d.git("rev-parse", "HEAD", cwd=repo)
             findings = [{"occurrenceId": f"occ_{n}", "title": f"Finding {n}", "severity": {"level": "high"}}
                         for n in (1, 2)]
@@ -316,8 +330,30 @@ class LauncherTests(unittest.TestCase):
                 return real_run(args, **kwargs)
             def fake_patch(command, output, **kwargs):
                 ident = command[2]
+                self.assertEqual(kwargs["cwd"], repo)
                 self.assertEqual((repo / "a.py").read_text(), "original\n")
+                self.assertEqual((repo / "hidden.py").read_text(), "committed\n")
+                self.assertEqual((repo / "skipped.py").read_text(), "committed\n")
+                self.assertEqual((repo / "vendor/submodule/extra.py").read_text(), "committed\n")
+                self.assertFalse((repo / "ignored/state").exists())
+                self.assertFalse((repo / "vendor/submodule/cache/state").exists())
+                self.assertEqual(d.git("ls-files", "-v", "hidden.py", cwd=repo), "H hidden.py")
+                self.assertEqual(d.git("ls-files", "-v", "skipped.py", cwd=repo), "H skipped.py")
+                self.assertEqual(d.git("ls-files", "-v", "extra.py", cwd=repo / "vendor/submodule"), "H extra.py")
+                current = d.git("branch", "--show-current", cwd=repo)
+                refs = [ref for ref in d.git("for-each-ref", "--format=%(refname)", "refs/heads/codex", cwd=repo).splitlines()
+                        if ref.startswith("refs/heads/codex/daybreak-")]
+                self.assertEqual(refs, [f"refs/heads/{current}"])
                 self.assertIn('model="gpt-daybreak-blue-latest"', command)
+                if ident == "occ_1":
+                    (repo / "ignored").mkdir()
+                    (repo / "ignored/state").write_text("first finding\n")
+                    d.git("update-index", "--assume-unchanged", "hidden.py", cwd=repo)
+                    (repo / "hidden.py").write_text("hidden first-finding change\n")
+                    d.git("update-index", "--skip-worktree", "skipped.py", cwd=repo)
+                    (repo / "skipped.py").write_text("skipped first-finding change\n")
+                    (repo / "vendor/submodule/cache").mkdir()
+                    (repo / "vendor/submodule/cache/state").write_text("first finding\n")
                 (repo / "a.py").write_text("fixed " + ident + "\n")
                 return {"patches": [{"occurrenceId": ident, "status": "verified", "files": ["a.py"], "verification": "Fixture check passed"}]}
             with patch.object(d, "run", side_effect=fake_run), patch.object(d, "json_command", side_effect=fake_patch), patch.object(d, "ensure_login", return_value=True):
